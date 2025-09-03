@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Transform: AWS::Serverless-2016-10-31
+
+Description: N8N SELF-HOSTED INFRASTRUCTURE WITH ACM + CLOUDFRONT
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: n8n
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  HostedZoneId:
+    Type: String
+    Default: Z00033452JLLJGRAM0F3Y
+  DomainName:
+    Type: String
+    Default: n8n.floor-studios.com
+  CertificateId:
+    Type: String
+    Default: b709fc50-5f80-49ff-8f99-f8f8aec50b71
+
+Conditions:
+  IsProd: !Equals 
+    - !Ref Environment
+    - prod
+
+Resources:
+  # VPC Configuration
+  N8nVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpc
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-igw
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref N8nVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref N8nVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-subnet
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref N8nVPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-rtb
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  N8nSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-instance-sg
+      GroupDescription: security group for n8n instance  # required
+      VpcId: !Ref N8nVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5678
+          ToPort: 5678
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-instance-sg
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EC2 Instance
+  N8nInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-095af7cb7ddb447ef  # Amazon Linux 2023
+      InstanceType: t3.micro
+      KeyName: !Sub key-pair-${ProjectName}-${Environment}
+      SecurityGroupIds:
+        - !Ref N8nSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          #  Log Output Setting
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          echo "Starting user-data script..."
+          
+          #  System Update
+          dnf update -y
+          
+          # Docker Install
+          dnf install -y docker
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+          
+          # Docker Compose Install
+          curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+          
+          # n8n Directory Create
+          mkdir -p /home/ec2-user/n8n/logs
+          chown -R ec2-user:ec2-user /home/ec2-user/n8n
+          
+          # Docker Compose File Create
+          cat > /home/ec2-user/n8n/docker-compose.yaml << 'EOF'
+          services:
+            n8n:
+              image: n8nio/n8n:latest
+              container_name: n8n
+              restart: unless-stopped
+              ports:
+                - "0.0.0.0:5678:5678"
+              environment:
+                - N8N_HOST=0.0.0.0
+                - N8N_PORT=5678
+                - N8N_PROTOCOL=https
+                - WEBHOOK_URL=https://WEBHOOK_DOMAIN_PLACEHOLDER/
+                - GENERIC_TIMEZONE=Asia/Tokyo
+                - N8N_LOG_LEVEL=info
+                - N8N_LOG_OUTPUT=console,file
+                - N8N_LOG_FILE_LOCATION=/home/node/.n8n/logs/n8n.log
+                - N8N_PROXY_HOPS=1
+                - N8N_RUNNERS_ENABLED=true
+                - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+                - DB_TYPE=sqlite
+                - DB_SQLITE_POOL_SIZE=10
+                - DB_SQLITE_FILE=/home/node/.n8n/database.sqlite
+              volumes:
+                - n8n_data:/home/node/.n8n
+          
+          volumes:
+            n8n_data:
+          EOF
+          
+          # Replace placeholder with actual domain
+          if [ "${Environment}" = "prod" ]; then
+            sed -i 's|WEBHOOK_DOMAIN_PLACEHOLDER|'${DomainName}'|g' /home/ec2-user/n8n/docker-compose.yaml
+          else
+            sed -i 's|WEBHOOK_DOMAIN_PLACEHOLDER|'${Environment}'.'${DomainName}'|g' /home/ec2-user/n8n/docker-compose.yaml
+          fi
+          
+          # N8N Start
+          cd /home/ec2-user/n8n
+          sudo -u ec2-user /usr/local/bin/docker-compose up -d
+          
+          echo "User-data script completed successfully!"
+          echo "N8N is starting up... Please wait a few minutes."
+
+      Tags:
+        - Key: Name
+          Value: !Sub n8n-${Environment}-instance
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: N8nInstance
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !If
+            - IsProd
+            - !Ref DomainName
+            - !Sub ${Environment}.${DomainName}
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub ${ProjectName}-${Environment}-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          CachedMethods:
+            - GET
+            - HEAD
+          # UseOriginCacheControlHeaders
+          CachePolicyId: 83da9c7e-98b4-4e11-a168-04f0df8e2c65
+          # AllViewer
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          # CORS-With-Preflight
+          ResponseHeadersPolicyId: 5cc3b908-e619-4b99-88e5-2cf7f45965bd
+        Enabled: true
+        HttpVersion: http2
+        # EC2 Public DNS Name
+        Origins:
+          - Id: !Sub ${ProjectName}-${Environment}-origin
+            DomainName: !GetAtt N8nInstance.PublicDnsName
+            CustomOriginConfig:
+              HTTPPort: 5678
+              OriginProtocolPolicy: http-only
+        #  Price Class
+        PriceClass: PriceClass_100
+        # Certificate
+        ViewerCertificate:
+          AcmCertificateArn: !Sub arn:${AWS::Partition}:acm:us-east-1:${AWS::AccountId}:certificate/${CertificateId}
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route53 Record Set 
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !If
+        - IsProd
+        - !Ref DomainName
+        - !Sub ${Environment}.${DomainName}
+      HostedZoneId: !Ref HostedZoneId
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudFrontUpdatePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront:GetDistribution
+                  - cloudfront:UpdateDistribution
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: 
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-cloudfront-updater:*
+
+  # Lambda Function
+  CloudFrontUpdateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-cloudfront-updater
+      Runtime: python3.13
+      CodeUri: ../src/handler/CloudFrontUpdateFunction/
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          DISTRIBUTION_ID: !Ref CloudFrontDistribution
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+
+  # EventBridge Rule
+  EC2StateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-state-change
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - EC2 Instance State-change Notification
+        detail:
+          state:
+            - running
+          instance-id:
+            - !Ref N8nInstance
+      Targets:
+        - Arn: !GetAtt CloudFrontUpdateFunction.Arn
+          Id: CloudFrontUpdateTarget
+
+  # Lambda Permission for EventBridge
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CloudFrontUpdateFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EC2StateChangeRule.Arn
